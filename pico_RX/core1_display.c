@@ -1,0 +1,404 @@
+#include <stdio.h>
+#include <string.h>
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
+#include "hardware/irq.h"
+
+#include "dvi.h"
+#include "dvi_serialiser.h"
+#include "dvi_timing.h"
+#include "tmds_encode.h"
+#include "main_shared.h"
+
+// ─── Resolução do framebuffer ─────────────────────────────────────────────────
+// DVI 640x480p com pixel doubling (DVI_VERTICAL_REPEAT=2)
+// → framebuffer real = 320x240
+#define FRAME_WIDTH   320
+#define FRAME_HEIGHT  240
+
+// ─── Configuração de pinos da placa HDMI BitDogLab ────────────────────────────
+// Baseado em common_dvi_pin_configs.h (picodvi_dvi_cfg)
+// GP16=D0, GP17=D1, GP18=D2, GP19=CLK
+static const struct dvi_serialiser_cfg bitdoglab_hdmi_cfg = {
+    .pio              = pio0,
+    .sm_tmds          = {0, 1, 2},
+    .pins_tmds        = {16, 17, 18},
+    .pins_clk         = 19,
+    .invert_diffpairs = true
+};
+
+// ─── Cores RGB332 (RRRGGGBB) ──────────────────────────────────────────────────
+#define COR_PRETO       0x00u
+#define COR_BRANCO      0xFFu
+#define COR_AZUL_ESC    0x02u   // fundo geral
+#define COR_AZUL_MEDIO  0x03u   // fundo título
+#define COR_CIANO       0x1Fu   // borda e destaques
+#define COR_VERDE       0x1Cu   // status OK / Power On
+#define COR_VERMELHO    0xE0u   // status erro / Watchdog Reset
+#define COR_AMARELO     0xFCu   // rótulos
+#define COR_LARANJA     0xE4u   // valores sensor
+#define COR_CINZA       0x6Du   // texto secundário
+
+// ─── Framebuffer estático 320×240 = 75 KB ─────────────────────────────────────
+// O RP2040 tem 264 KB de RAM — cabe com folga
+static uint8_t framebuf[FRAME_HEIGHT][FRAME_WIDTH];
+
+// ─── Instância DVI ────────────────────────────────────────────────────────────
+static struct dvi_inst dvi0;
+
+// ─── Estado interno do display ────────────────────────────────────────────────
+static TipoReset_t reset_info    = RESET_POWER_ON;
+static bool        sinal_ok      = false;
+static uint32_t    ultimo_pacote = 0;
+
+// ─── Declarações externas (main.c) ───────────────────────────────────────────
+extern void core0_get_dados(DadosSensor_t *dst);
+extern void core1_set_heartbeat(void);
+
+// ─── Fonte 8×8 embutida (ASCII 32–127) ───────────────────────────────────────
+static const uint8_t fonte8x8[96][8] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // ' '
+    {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00}, // '!'
+    {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, // '"'
+    {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00}, // '#'
+    {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00}, // '$'
+    {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00}, // '%'
+    {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00}, // '&'
+    {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00}, // '\''
+    {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00}, // '('
+    {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00}, // ')'
+    {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00}, // '*'
+    {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00}, // '+'
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06}, // ','
+    {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00}, // '-'
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00}, // '.'
+    {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00}, // '/'
+    {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, // '0'
+    {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00}, // '1'
+    {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, // '2'
+    {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00}, // '3'
+    {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, // '4'
+    {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00}, // '5'
+    {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, // '6'
+    {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00}, // '7'
+    {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, // '8'
+    {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00}, // '9'
+    {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00}, // ':'
+    {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06}, // ';'
+    {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00}, // '<'
+    {0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00}, // '='
+    {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00}, // '>'
+    {0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00}, // '?'
+    {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00}, // '@'
+    {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00}, // 'A'
+    {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00}, // 'B'
+    {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00}, // 'C'
+    {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00}, // 'D'
+    {0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00}, // 'E'
+    {0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00}, // 'F'
+    {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00}, // 'G'
+    {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00}, // 'H'
+    {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // 'I'
+    {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00}, // 'J'
+    {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00}, // 'K'
+    {0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00}, // 'L'
+    {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00}, // 'M'
+    {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00}, // 'N'
+    {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00}, // 'O'
+    {0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00}, // 'P'
+    {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00}, // 'Q'
+    {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00}, // 'R'
+    {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00}, // 'S'
+    {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // 'T'
+    {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00}, // 'U'
+    {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00}, // 'V'
+    {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00}, // 'W'
+    {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00}, // 'X'
+    {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00}, // 'Y'
+    {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00}, // 'Z'
+    {0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00}, // '['
+    {0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00}, // '\'
+    {0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00}, // ']'
+    {0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00}, // '^'
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF}, // '_'
+    {0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00}, // '`'
+    {0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00}, // 'a'
+    {0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00}, // 'b'
+    {0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00}, // 'c'
+    {0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00}, // 'd'
+    {0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00}, // 'e'
+    {0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00}, // 'f'
+    {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F}, // 'g'
+    {0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00}, // 'h'
+    {0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00}, // 'i'
+    {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E}, // 'j'
+    {0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00}, // 'k'
+    {0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // 'l'
+    {0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00}, // 'm'
+    {0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00}, // 'n'
+    {0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00}, // 'o'
+    {0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F}, // 'p'
+    {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78}, // 'q'
+    {0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00}, // 'r'
+    {0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00}, // 's'
+    {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00}, // 't'
+    {0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00}, // 'u'
+    {0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00}, // 'v'
+    {0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00}, // 'w'
+    {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00}, // 'x'
+    {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F}, // 'y'
+    {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00}, // 'z'
+    {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00}, // '{'
+    {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, // '|'
+    {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00}, // '}'
+    {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // '~'
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // DEL
+};
+
+// ─── Protótipos internos ──────────────────────────────────────────────────────
+static void fb_clear(uint8_t cor);
+static void fb_fill_rect(int x, int y, int w, int h, uint8_t cor);
+static void fb_draw_border(int espessura, uint8_t cor);
+static void fb_draw_char(int x, int y, char c, uint8_t fg, uint8_t bg);
+static void fb_draw_text(int x, int y, const char *txt, uint8_t fg, uint8_t bg);
+static void fb_draw_hline(int x, int y, int w, uint8_t cor);
+static void desenhar_tela(const DadosSensor_t *d);
+static void push_scanlines(void);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chamada pelo Core 0 ANTES de lançar o Core 1
+// ─────────────────────────────────────────────────────────────────────────────
+void core1_set_reset_info(TipoReset_t tipo) {
+    reset_info = tipo;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ponto de entrada do Core 1
+// ─────────────────────────────────────────────────────────────────────────────
+void core1_entry(void) {
+
+    // ── Aumenta voltagem do núcleo para 252 MHz ───────────────────────────────
+    vreg_set_voltage(VREG_VOLTAGE_1_20);
+    sleep_ms(10);
+
+    // ── Inicializa instância DVI ──────────────────────────────────────────────
+    dvi0.timing  = &dvi_timing_640x480p_60hz;
+    dvi0.ser_cfg = bitdoglab_hdmi_cfg;
+    dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
+
+    // ── Registra IRQs DMA neste core ─────────────────────────────────────────
+    dvi_register_irqs_this_core(&dvi0, DMA_IRQ_0);
+
+    // ── Desenha tela inicial antes de iniciar o DVI ───────────────────────────
+    DadosSensor_t d_inicial = {0};
+    desenhar_tela(&d_inicial);
+
+    // ── Empurra os primeiros scanlines para a fila antes de start ─────────────
+    push_scanlines();
+
+    // ── Sinaliza ao Core 0 que está pronto ────────────────────────────────────
+    multicore_fifo_push_blocking(MSG_CORE1_READY);
+
+    // ── Inicia o DVI (aguarda FIFO cheia) ─────────────────────────────────────
+    dvi_start(&dvi0);
+
+    // ─── Loop principal do Core 1 ─────────────────────────────────────────────
+    DadosSensor_t dados = {0};
+    uint32_t      ultimo_dado_ms = 0;
+
+    while (true) {
+
+        // Verifica dados novos do Core 0 (não bloqueante)
+        if (multicore_fifo_rvalid()) {
+            uint32_t msg = multicore_fifo_pop_blocking();
+            if (msg == MSG_DADOS_NOVOS) {
+                core0_get_dados(&dados);
+                sinal_ok       = true;
+                ultimo_dado_ms = to_ms_since_boot(get_absolute_time());
+            }
+        }
+
+        // Timeout: sem pacote por 3 s → sinal perdido
+        if (sinal_ok) {
+            uint32_t agora = to_ms_since_boot(get_absolute_time());
+            if ((agora - ultimo_dado_ms) > 3000) {
+                sinal_ok = false;
+            }
+        }
+
+        // Redesenha a tela e empurra scanlines para o DVI
+        desenhar_tela(&dados);
+        push_scanlines();
+
+        // Sinaliza heartbeat ao Core 0 (Watchdog)
+        core1_set_heartbeat();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Empurra todas as scanlines do framebuffer para a fila DVI (8bpp)
+// ─────────────────────────────────────────────────────────────────────────────
+static void push_scanlines(void) {
+    uint pixwidth         = dvi0.timing->h_active_pixels;
+    uint words_per_channel = pixwidth / DVI_SYMBOLS_PER_WORD;
+
+    for (int y = 0; y < FRAME_HEIGHT; y++) {
+        uint32_t *tmdsbuf;
+        queue_remove_blocking_u32(&dvi0.q_tmds_free, &tmdsbuf);
+
+        // Encode 8bpp RGB332 → TMDS para os 3 canais (B, G, R)
+        tmds_encode_data_channel_8bpp(
+            (uint32_t *)framebuf[y],
+            tmdsbuf + 0 * words_per_channel,
+            pixwidth / 2,
+            DVI_8BPP_BLUE_MSB,  DVI_8BPP_BLUE_LSB);
+
+        tmds_encode_data_channel_8bpp(
+            (uint32_t *)framebuf[y],
+            tmdsbuf + 1 * words_per_channel,
+            pixwidth / 2,
+            DVI_8BPP_GREEN_MSB, DVI_8BPP_GREEN_LSB);
+
+        tmds_encode_data_channel_8bpp(
+            (uint32_t *)framebuf[y],
+            tmdsbuf + 2 * words_per_channel,
+            pixwidth / 2,
+            DVI_8BPP_RED_MSB,   DVI_8BPP_RED_LSB);
+
+        queue_add_blocking_u32(&dvi0.q_tmds_valid, &tmdsbuf);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Desenha a interface completa no framebuffer
+// ─────────────────────────────────────────────────────────────────────────────
+static void desenhar_tela(const DadosSensor_t *d) {
+    char buf[64];
+
+    // ── Fundo ─────────────────────────────────────────────────────────────────
+    fb_clear(COR_AZUL_ESC);
+
+    // ── Borda externa (3px ciano) ─────────────────────────────────────────────
+    fb_draw_border(3, COR_CIANO);
+
+    // ── Barra de título ───────────────────────────────────────────────────────
+    fb_fill_rect(3, 3, FRAME_WIDTH - 6, 18, COR_AZUL_MEDIO);
+    fb_draw_text(8, 6, "TELEMETRIA DVI - BitDogLab", COR_AMARELO, COR_AZUL_MEDIO);
+
+    // ── Linha separadora ──────────────────────────────────────────────────────
+    fb_draw_hline(3, 22, FRAME_WIDTH - 6, COR_CIANO);
+
+    // ── Status do último reset ────────────────────────────────────────────────
+    if (reset_info == RESET_WATCHDOG) {
+        fb_fill_rect(6, 26, FRAME_WIDTH - 12, 12, COR_VERMELHO);
+        fb_draw_text(10, 28, "! WATCHDOG RESET - falha recuperada !", COR_BRANCO, COR_VERMELHO);
+    } else {
+        fb_fill_rect(6, 26, FRAME_WIDTH - 12, 12, COR_VERDE);
+        fb_draw_text(10, 28, "  POWER ON - inicializacao normal    ", COR_PRETO, COR_VERDE);
+    }
+
+    // ── Linha separadora ──────────────────────────────────────────────────────
+    fb_draw_hline(3, 42, FRAME_WIDTH - 6, COR_CIANO);
+
+    // ── Dados do sensor ───────────────────────────────────────────────────────
+    fb_draw_text(10, 52, "TEMPERATURA:", COR_AMARELO, COR_AZUL_ESC);
+    if (sinal_ok) {
+        // Converte float para string manualmente (sem printf float no Pico)
+        int temp_int  = (int)d->temperatura;
+        int temp_frac = (int)((d->temperatura - temp_int) * 100);
+        if (temp_frac < 0) temp_frac = -temp_frac;
+        snprintf(buf, sizeof(buf), "%d.%02d C", temp_int, temp_frac);
+    } else {
+        snprintf(buf, sizeof(buf), "---");
+    }
+    fb_fill_rect(110, 52, 100, 10, COR_AZUL_ESC);
+    fb_draw_text(110, 52, buf, COR_LARANJA, COR_AZUL_ESC);
+
+    fb_draw_text(10, 68, "UMIDADE:    ", COR_AMARELO, COR_AZUL_ESC);
+    if (sinal_ok) {
+        snprintf(buf, sizeof(buf), "%d %%", d->umidade);
+    } else {
+        snprintf(buf, sizeof(buf), "---");
+    }
+    fb_fill_rect(110, 68, 100, 10, COR_AZUL_ESC);
+    fb_draw_text(110, 68, buf, COR_LARANJA, COR_AZUL_ESC);
+
+    fb_draw_text(10, 84, "PACOTE Nro: ", COR_AMARELO, COR_AZUL_ESC);
+    if (sinal_ok) {
+        snprintf(buf, sizeof(buf), "%05lu", (unsigned long)d->contador);
+    } else {
+        snprintf(buf, sizeof(buf), "---");
+    }
+    fb_fill_rect(110, 84, 100, 10, COR_AZUL_ESC);
+    fb_draw_text(110, 84, buf, COR_LARANJA, COR_AZUL_ESC);
+
+    // ── Linha separadora ──────────────────────────────────────────────────────
+    fb_draw_hline(3, 100, FRAME_WIDTH - 6, COR_CIANO);
+
+    // ── Status do sinal UART ──────────────────────────────────────────────────
+    fb_draw_text(10, 108, "SINAL UART:", COR_AMARELO, COR_AZUL_ESC);
+    if (sinal_ok) {
+        fb_fill_rect(100, 106, 80, 12, COR_VERDE);
+        fb_draw_text(104, 108, " OK ", COR_PRETO, COR_VERDE);
+    } else {
+        fb_fill_rect(100, 106, 120, 12, COR_VERMELHO);
+        fb_draw_text(104, 108, " SEM SINAL ", COR_BRANCO, COR_VERMELHO);
+    }
+
+    // ── Rodapé ────────────────────────────────────────────────────────────────
+    fb_draw_hline(3, FRAME_HEIGHT - 16, FRAME_WIDTH - 6, COR_CIANO);
+    fb_draw_text(8, FRAME_HEIGHT - 12, "Embarcatech | WDT: ATIVO | DVI 640x480p", COR_CINZA, COR_AZUL_ESC);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Primitivas de desenho no framebuffer
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void fb_clear(uint8_t cor) {
+    memset(framebuf, cor, sizeof(framebuf));
+}
+
+static void fb_fill_rect(int x, int y, int w, int h, uint8_t cor) {
+    for (int j = y; j < y + h && j < FRAME_HEIGHT; j++) {
+        for (int i = x; i < x + w && i < FRAME_WIDTH; i++) {
+            if (i >= 0 && j >= 0)
+                framebuf[j][i] = cor;
+        }
+    }
+}
+
+static void fb_draw_border(int esp, uint8_t cor) {
+    fb_fill_rect(0,                0,              FRAME_WIDTH, esp,           cor); // topo
+    fb_fill_rect(0,                FRAME_HEIGHT-esp, FRAME_WIDTH, esp,         cor); // base
+    fb_fill_rect(0,                0,              esp, FRAME_HEIGHT,          cor); // esq
+    fb_fill_rect(FRAME_WIDTH-esp,  0,              esp, FRAME_HEIGHT,          cor); // dir
+}
+
+static void fb_draw_hline(int x, int y, int w, uint8_t cor) {
+    fb_fill_rect(x, y, w, 1, cor);
+}
+
+static void fb_draw_char(int x, int y, char c, uint8_t fg, uint8_t bg) {
+    if (c < 32 || c > 127) c = '?';
+    const uint8_t *glyph = fonte8x8[(uint8_t)(c - 32)];
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            int px = x + col;
+            int py = y + row;
+            if (px < 0 || px >= FRAME_WIDTH || py < 0 || py >= FRAME_HEIGHT)
+                continue;
+            framebuf[py][px] = (glyph[row] & (0x80 >> col)) ? fg : bg;
+        }
+    }
+}
+
+static void fb_draw_text(int x, int y, const char *txt, uint8_t fg, uint8_t bg) {
+    int cx = x;
+    while (*txt) {
+        fb_draw_char(cx, y, *txt++, fg, bg);
+        cx += 8;
+        if (cx + 8 > FRAME_WIDTH) break;
+    }
+}
