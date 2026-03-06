@@ -157,112 +157,71 @@ static const uint8_t fonte8x8[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // DEL
 };
 
-// ─── Protótipos internos ──────────────────────────────────────────────────────
 static void fb_clear(uint8_t cor);
 static void fb_fill_rect(int x, int y, int w, int h, uint8_t cor);
 static void fb_draw_border(int espessura, uint8_t cor);
 static void fb_draw_char(int x, int y, char c, uint8_t fg, uint8_t bg);
 static void fb_draw_text(int x, int y, const char *txt, uint8_t fg, uint8_t bg);
 static void fb_draw_hline(int x, int y, int w, uint8_t cor);
-static void desenhar_tela(const DadosSensor_t *d);
+void desenhar_tela(const DadosSensor_t *d, bool sinal_ok);
 static void push_scanlines(void);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Chamada pelo Core 0 ANTES de lançar o Core 1
-// ─────────────────────────────────────────────────────────────────────────────
+
 void core1_set_reset_info(TipoReset_t tipo) {
     reset_info = tipo;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Ponto de entrada do Core 1
-// ─────────────────────────────────────────────────────────────────────────────
+
 void core1_entry(void) {
-
-    // ── Aumenta voltagem do núcleo para 252 MHz ───────────────────────────────
-    vreg_set_voltage(VREG_VOLTAGE_1_20);
-    sleep_ms(10);
-
     // ── Inicializa instância DVI ──────────────────────────────────────────────
     dvi0.timing  = &dvi_timing_640x480p_60hz;
     dvi0.ser_cfg = bitdoglab_hdmi_cfg;
     dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
 
-    // ── Registra IRQs DMA neste core ─────────────────────────────────────────
     dvi_register_irqs_this_core(&dvi0, DMA_IRQ_0);
 
-    // ── Desenha tela inicial antes de iniciar o DVI ───────────────────────────
+    fb_clear(COR_AZUL_ESC);
+
     DadosSensor_t d_inicial = {0};
-    desenhar_tela(&d_inicial);
+    desenhar_tela(&d_inicial, false);
 
-    // ── Empurra os primeiros scanlines para a fila antes de start ─────────────
-    push_scanlines();
-
-    // ── Sinaliza ao Core 0 que está pronto ────────────────────────────────────
     multicore_fifo_push_blocking(MSG_CORE1_READY);
 
-    // ── Inicia o DVI (aguarda FIFO cheia) ─────────────────────────────────────
     dvi_start(&dvi0);
 
-    // ─── Loop principal do Core 1 ─────────────────────────────────────────────
-    DadosSensor_t dados = {0};
-    uint32_t      ultimo_dado_ms = 0;
-
     while (true) {
-
-        // Verifica dados novos do Core 0 (não bloqueante)
-        if (multicore_fifo_rvalid()) {
-            uint32_t msg = multicore_fifo_pop_blocking();
-            if (msg == MSG_DADOS_NOVOS) {
-                core0_get_dados(&dados);
-                sinal_ok       = true;
-                ultimo_dado_ms = to_ms_since_boot(get_absolute_time());
-            }
-        }
-
-        // Timeout: sem pacote por 3 s → sinal perdido
-        if (sinal_ok) {
-            uint32_t agora = to_ms_since_boot(get_absolute_time());
-            if ((agora - ultimo_dado_ms) > 3000) {
-                sinal_ok = false;
-            }
-        }
-
-        // Redesenha a tela e empurra scanlines para o DVI
-        desenhar_tela(&dados);
         push_scanlines();
-
-        // Sinaliza heartbeat ao Core 0 (Watchdog)
-        core1_set_heartbeat();
+        core1_set_heartbeat(); 
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Empurra todas as scanlines do framebuffer para a fila DVI (8bpp)
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── 2. Empurra as 480 scanlines corretas ────────────────────────────────────
 static void push_scanlines(void) {
     uint pixwidth         = dvi0.timing->h_active_pixels;
     uint words_per_channel = pixwidth / DVI_SYMBOLS_PER_WORD;
 
-    for (int y = 0; y < FRAME_HEIGHT; y++) {
+    // ATENÇÃO: O laço agora deve iterar 480 vezes (h_active_lines do 640x480p)
+    for (int y = 0; y < 480; y++) {
         uint32_t *tmdsbuf;
         queue_remove_blocking_u32(&dvi0.q_tmds_free, &tmdsbuf);
 
-        // Encode 8bpp RGB332 → TMDS para os 3 canais (B, G, R)
+        // O segredo do pixel doubling vertical: lemos do framebuf[y / 2]
+        uint8_t *linha_pixels = framebuf[y / 2];
+
         tmds_encode_data_channel_8bpp(
-            (uint32_t *)framebuf[y],
+            (uint32_t *)linha_pixels,
             tmdsbuf + 0 * words_per_channel,
             pixwidth / 2,
             DVI_8BPP_BLUE_MSB,  DVI_8BPP_BLUE_LSB);
 
         tmds_encode_data_channel_8bpp(
-            (uint32_t *)framebuf[y],
+            (uint32_t *)linha_pixels,
             tmdsbuf + 1 * words_per_channel,
             pixwidth / 2,
             DVI_8BPP_GREEN_MSB, DVI_8BPP_GREEN_LSB);
 
         tmds_encode_data_channel_8bpp(
-            (uint32_t *)framebuf[y],
+            (uint32_t *)linha_pixels,
             tmdsbuf + 2 * words_per_channel,
             pixwidth / 2,
             DVI_8BPP_RED_MSB,   DVI_8BPP_RED_LSB);
@@ -271,14 +230,10 @@ static void push_scanlines(void) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Desenha a interface completa no framebuffer
-// ─────────────────────────────────────────────────────────────────────────────
-static void desenhar_tela(const DadosSensor_t *d) {
+void desenhar_tela(const DadosSensor_t *d, bool sinal_ok) {
     char buf[64];
 
-    // ── Fundo ─────────────────────────────────────────────────────────────────
-    fb_clear(COR_AZUL_ESC);
+    // NUNCA use fb_clear aqui dentro!
 
     // ── Borda externa (3px ciano) ─────────────────────────────────────────────
     fb_draw_border(3, COR_CIANO);
@@ -305,33 +260,33 @@ static void desenhar_tela(const DadosSensor_t *d) {
     // ── Dados do sensor ───────────────────────────────────────────────────────
     fb_draw_text(10, 52, "TEMPERATURA:", COR_AMARELO, COR_AZUL_ESC);
     if (sinal_ok) {
-        // Converte float para string manualmente (sem printf float no Pico)
         int temp_int  = (int)d->temperatura;
         int temp_frac = (int)((d->temperatura - temp_int) * 100);
         if (temp_frac < 0) temp_frac = -temp_frac;
-        snprintf(buf, sizeof(buf), "%d.%02d C", temp_int, temp_frac);
+        // NOTA: Os espaços em branco no final apagam o lixo antigo!
+        snprintf(buf, sizeof(buf), "%d.%02d C      ", temp_int, temp_frac);
     } else {
-        snprintf(buf, sizeof(buf), "---");
+        snprintf(buf, sizeof(buf), "---          ");
     }
-    fb_fill_rect(110, 52, 100, 10, COR_AZUL_ESC);
+    // Removemos o fb_fill_rect daqui!
     fb_draw_text(110, 52, buf, COR_LARANJA, COR_AZUL_ESC);
 
     fb_draw_text(10, 68, "UMIDADE:    ", COR_AMARELO, COR_AZUL_ESC);
     if (sinal_ok) {
-        snprintf(buf, sizeof(buf), "%d %%", d->umidade);
+        snprintf(buf, sizeof(buf), "%d %%        ", d->umidade);
     } else {
-        snprintf(buf, sizeof(buf), "---");
+        snprintf(buf, sizeof(buf), "---          ");
     }
-    fb_fill_rect(110, 68, 100, 10, COR_AZUL_ESC);
+    // Removemos o fb_fill_rect daqui!
     fb_draw_text(110, 68, buf, COR_LARANJA, COR_AZUL_ESC);
 
     fb_draw_text(10, 84, "PACOTE Nro: ", COR_AMARELO, COR_AZUL_ESC);
     if (sinal_ok) {
-        snprintf(buf, sizeof(buf), "%05lu", (unsigned long)d->contador);
+        snprintf(buf, sizeof(buf), "%05lu        ", (unsigned long)d->contador);
     } else {
-        snprintf(buf, sizeof(buf), "---");
+        snprintf(buf, sizeof(buf), "---          ");
     }
-    fb_fill_rect(110, 84, 100, 10, COR_AZUL_ESC);
+    // Removemos o fb_fill_rect daqui!
     fb_draw_text(110, 84, buf, COR_LARANJA, COR_AZUL_ESC);
 
     // ── Linha separadora ──────────────────────────────────────────────────────
@@ -340,16 +295,12 @@ static void desenhar_tela(const DadosSensor_t *d) {
     // ── Status do sinal UART ──────────────────────────────────────────────────
     fb_draw_text(10, 108, "SINAL UART:", COR_AMARELO, COR_AZUL_ESC);
     if (sinal_ok) {
-        fb_fill_rect(100, 106, 80, 12, COR_VERDE);
-        fb_draw_text(104, 108, " OK ", COR_PRETO, COR_VERDE);
+        // A própria string de espaços com fundo verde apaga o antigo bloco vermelho
+        fb_draw_text(100, 108, " OK          ", COR_PRETO, COR_VERDE);
     } else {
-        fb_fill_rect(100, 106, 120, 12, COR_VERMELHO);
-        fb_draw_text(104, 108, " SEM SINAL ", COR_BRANCO, COR_VERMELHO);
+        // A própria string de espaços com fundo vermelho apaga o antigo bloco verde
+        fb_draw_text(100, 108, " SEM SINAL   ", COR_BRANCO, COR_VERMELHO);
     }
-
-    // ── Rodapé ────────────────────────────────────────────────────────────────
-    fb_draw_hline(3, FRAME_HEIGHT - 16, FRAME_WIDTH - 6, COR_CIANO);
-    fb_draw_text(8, FRAME_HEIGHT - 12, "Embarcatech | WDT: ATIVO | DVI 640x480p", COR_CINZA, COR_AZUL_ESC);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,7 +340,7 @@ static void fb_draw_char(int x, int y, char c, uint8_t fg, uint8_t bg) {
             int py = y + row;
             if (px < 0 || px >= FRAME_WIDTH || py < 0 || py >= FRAME_HEIGHT)
                 continue;
-            framebuf[py][px] = (glyph[row] & (0x80 >> col)) ? fg : bg;
+            framebuf[py][px] = (glyph[row] & (1 << col)) ? fg : bg;
         }
     }
 }

@@ -9,8 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-# ─── libdvi LOCAL (copiada do exemplo BitDogLab) ──────────────────────────────
-# A pasta libdvi deve estar dentro do projeto: pico_RX/libdvi/
+
 add_subdirectory(libdvi)
 
 # ─── Executável principal ─────────────────────────────────────────────────────

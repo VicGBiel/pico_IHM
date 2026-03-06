@@ -8,6 +8,10 @@
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
 #include "main_shared.h"
+#include "hardware/vreg.h"
+#include "hardware/structs/bus_ctrl.h"
+
+extern void desenhar_tela(const DadosSensor_t *d, bool sinal_ok);
 
 // ─── Configurações UART ───────────────────────────────────────────────────────
 #define UART_ID         uart0
@@ -15,7 +19,7 @@
 #define UART_RX_PIN     1           // GP1 → RX
 
 // ─── Configurações Watchdog ───────────────────────────────────────────────────
-#define WDT_TIMEOUT_MS  2000
+#define WDT_TIMEOUT_MS  3000
 
 // ─── Protocolo de pacote UART ─────────────────────────────────────────────────
 #define PKT_PREFIX      "$PKT,"
@@ -26,10 +30,8 @@ static DadosSensor_t dados_sensor = {0};
 static mutex_t       mutex_dados;
 
 // ─── Heartbeat: bit 0 = Core 0 vivo | bit 1 = Core 1 vivo ────────────────────
-static volatile uint32_t heartbeat_flags = 0;
-#define HEARTBEAT_CORE0  (1u << 0)
-#define HEARTBEAT_CORE1  (1u << 1)
-#define HEARTBEAT_ALL    (HEARTBEAT_CORE0 | HEARTBEAT_CORE1)
+static volatile bool vivo_core0 = false;
+static volatile bool vivo_core1 = false;
 
 // ─── Tipo de reset detectado na inicialização ─────────────────────────────────
 static TipoReset_t tipo_reset = RESET_POWER_ON;
@@ -46,11 +48,13 @@ static void        core0_loop(void);
 // ─────────────────────────────────────────────────────────────────────────────
 int main(void) {
 
-    // ── 0. Configura clock para 252 MHz (exigido pelo DVI 640x480p) ──────────
-    // Deve ser a PRIMEIRA chamada, antes de qualquer outro periférico
+    vreg_set_voltage(VREG_VOLTAGE_1_20); 
+    sleep_ms(10);
     set_sys_clock_khz(252000, true);
 
     stdio_init_all();
+
+    hw_set_bits(&bus_ctrl_hw->priority, BUSCTRL_BUS_PRIORITY_PROC1_BITS);
 
     // ── 1. Detecta causa do último reset ──────────────────────────────────────
     tipo_reset = diagnosticar_reset();
@@ -85,12 +89,17 @@ int main(void) {
     return 0;
 }
 
-// ─── Loop principal: recebe UART e alimenta o Watchdog ───────────────────────
 static void core0_loop(void) {
     char linha[PKT_MAX_LEN];
     int  idx = 0;
+    
+    bool uart_ok = false;
+    uint32_t ultimo_dado_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t ultimo_desenho_ms = 0; // Variável para controlar os FPS
+    DadosSensor_t dados_display = {0};
 
     while (true) {
+        bool deve_redesenhar = false;
 
         // Lê bytes da UART até '\n'
         if (uart_is_readable(UART_ID)) {
@@ -102,35 +111,43 @@ static void core0_loop(void) {
 
                 DadosSensor_t novo = {0};
                 if (parsear_pacote(linha, &novo)) {
-                    mutex_enter_blocking(&mutex_dados);
-                    dados_sensor              = novo;
-                    dados_sensor.dados_validos = true;
-                    mutex_exit(&mutex_dados);
-
-                    // Notifica Core 1
-                    if (!multicore_fifo_wready()) {
-                        multicore_fifo_drain();
-                    }
-                    multicore_fifo_push_blocking(MSG_DADOS_NOVOS);
+                    dados_display = novo;
+                    uart_ok = true;
+                    ultimo_dado_ms = to_ms_since_boot(get_absolute_time());
+                    deve_redesenhar = true;
                 }
-
             } else if (idx < PKT_MAX_LEN - 1) {
                 linha[idx++] = c;
             } else {
-                idx = 0; // buffer cheio sem '\n', descarta
+                idx = 0; 
             }
         }
 
-        // Seta heartbeat do Core 0
-        heartbeat_flags |= HEARTBEAT_CORE0;
-
-        // Alimenta WDT apenas se ambos os cores estão vivos
-        if ((heartbeat_flags & HEARTBEAT_ALL) == HEARTBEAT_ALL) {
-            watchdog_update();
-            heartbeat_flags = 0;
+        // Verifica o timeout do sinal (3 segundos)
+        uint32_t agora = to_ms_since_boot(get_absolute_time());
+        if (uart_ok && (agora - ultimo_dado_ms) > 3000) {
+            uart_ok = false;
+            deve_redesenhar = true;
         }
 
-        sleep_us(500);
+        // REDESENHA O ECRÃ NO MÁXIMO A 10 FPS (a cada 100ms)
+        // Isto liberta 90% do barramento de memória para o vídeo DVI não bloquear!
+        if (deve_redesenhar && (agora - ultimo_desenho_ms > 100)) {
+            desenhar_tela(&dados_display, uart_ok);
+            ultimo_desenho_ms = agora;
+        }
+
+        // Seta heartbeat do Core 0 e avalia o Watchdog
+        vivo_core0 = true;
+        if (vivo_core0 && vivo_core1) {
+            watchdog_update();
+            vivo_core0 = false;
+            vivo_core1 = false;
+        }
+
+        
+        // Pequena pausa para o processador respirar
+        sleep_us(100); 
     }
 }
 
@@ -166,7 +183,6 @@ static bool parsear_pacote(const char *linha, DadosSensor_t *out) {
     return true;
 }
 
-// ─── Chamada pelo Core 1 para obter os dados mais recentes ───────────────────
 void core0_get_dados(DadosSensor_t *dst) {
     mutex_enter_blocking(&mutex_dados);
     *dst = dados_sensor;
@@ -174,7 +190,6 @@ void core0_get_dados(DadosSensor_t *dst) {
     mutex_exit(&mutex_dados);
 }
 
-// ─── Chamada pelo Core 1 para sinalizar que está vivo ────────────────────────
 void core1_set_heartbeat(void) {
-    heartbeat_flags |= HEARTBEAT_CORE1;
+    vivo_core1 = true;
 }
